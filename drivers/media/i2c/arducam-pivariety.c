@@ -80,6 +80,8 @@ struct pivariety {
 	int lanes;
 	int bayer_order_volatile;
 	bool wait_until_free;
+	/* Set once SYSTEM_IDLE_REG is seen never to clear (e.g. CamArray 0x0003) */
+	bool idle_unsupported;
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *ctrls[MAX_CTRLS];
@@ -202,17 +204,36 @@ static int pivariety_write(struct pivariety *pivariety, u16 addr, u32 value)
 
 static int wait_for_free(struct pivariety *pivariety, int interval)
 {
+	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 	u32 value;
 	u32 count = 0;
 
-	while (count++ < (1000 / interval)) {
-		int ret = pivariety_read(pivariety, SYSTEM_IDLE_REG, &value);
-
-		if (!ret && !value)
-			break;
-		msleep(interval);
+	/*
+	 * Some firmware never clears SYSTEM_IDLE_REG. Waiting for it then costs
+	 * the full timeout on every call, and msleep() rounds up to whole
+	 * jiffies (~8 ms per iteration at HZ=250), which stretched the 1 s
+	 * timeout to 3.5-8 s: ~40 s at probe and ~32 s in VIDIOC_STREAMON,
+	 * dropping frames meanwhile. After the first timeout, pace by delay.
+	 */
+	if (pivariety->idle_unsupported) {
+		usleep_range(interval * 1000, interval * 1000 + 100);
+		return 0;
 	}
 
+	while (time_before(jiffies, timeout)) {
+		int ret = pivariety_read(pivariety, SYSTEM_IDLE_REG, &value);
+
+		count++;
+		if (!ret && !value)
+			goto out;
+		usleep_range(interval * 1000, interval * 1000 + 100);
+	}
+
+	pivariety->idle_unsupported = true;
+	v4l2_warn(&pivariety->sd,
+		  "%s: SYSTEM_IDLE_REG did not clear in 1 s, pacing by delay from now on\n",
+		  __func__);
+out:
 	v4l2_dbg(2, debug, &pivariety->sd, "%s: End wait, Count: %d.\n",
 		 __func__, count);
 
